@@ -1,0 +1,130 @@
+================================================================================
+TRAINING PERFORMANCE OPTIMIZATION — RECOMMENDATIONS
+Semantic Segmentation (HRNetV2 + C1), NVIDIA L4, single GPU
+Derived from the OFAT experiment study (experiments_ofat.md, Exps 0-21)
+================================================================================
+
+QUESTION ADDRESSED
+  As an ML performance engineer: focus on memory or training time? Which
+  combination of optimizations improves training performance, and what metrics
+  should I capture and watch?
+
+
+--------------------------------------------------------------------------------
+1. MEMORY OR TRAINING TIME?  ->  TIME. Memory is a means, not an end.
+--------------------------------------------------------------------------------
+Throughput (and ultimately time-to-target-accuracy) is the objective; memory is
+a budget you spend to buy throughput. Memory only matters in two cases:
+
+  1. It is a HARD CONSTRAINT - you are OOMing or cannot fit a useful batch.
+     Fix memory first, because nothing else matters if it will not run.
+  2. It is a LEVER - freeing memory lets you grow the batch, which raises
+     throughput ONLY when the GPU is underutilized.
+
+Proof from our study: gradient checkpointing freed 47% of memory but cost
+-19.5% throughput (Exp 18), because we were already compute-bound. The freed
+memory bought nothing.
+
+DEFAULT: optimize training time; touch memory only to remove an OOM constraint
+or to unlock a bigger batch when the GPU is starved.
+
+The decision is really about FINDING YOUR BOTTLENECK FIRST:
+
+  Bottleneck     | Signal                              | What to optimize
+  ---------------+-------------------------------------+-----------------------
+  Memory-bound   | OOM, or forced tiny batch           | AMP/BF16, checkpointing
+                 |                                     |   -> then grow batch
+  Data-bound     | Low GPU util + high data_time       | workers, prefetch,
+                 |                                     |   pin_memory, GPU decode
+  Compute-bound  | High GPU util, batch fits,          | precision, channels_last,
+                 |   data_time hidden                  |   better kernels
+
+
+--------------------------------------------------------------------------------
+2. WHICH COMBINATION ACTUALLY IMPROVES PERFORMANCE
+--------------------------------------------------------------------------------
+Ranked by MEASURED impact (kept stack, Exp 19 = +125% vs baseline):
+
+  Lever                                  | Impact          | When it works
+  ---------------------------------------+-----------------+---------------------
+  Max batch size                         | +43%            | Biggest lever - only
+                                         |                 | if GPU underutilized
+                                         |                 | + memory headroom
+  channels_last (NHWC)                   | +23%            | Mixed precision +
+                                         |                 | conv nets -> tensor
+                                         |                 | -core kernels
+  AMP -> BF16                            | +13-25%, -50%mem| Almost always; also
+                                         |                 | frees mem for batch
+  Data pipeline (workers/pin/            | ~+5% combined   | Marginal once not
+   persistent/prefetch)                  |                 | data-bound
+  Fused SGD / fused loss                 | +1-2% each      | Free, zero-downside
+
+THE ORDERING IS THE REAL INSIGHT:
+  BF16 first (frees memory + enables tensor cores)
+   -> then spend that memory on BATCH SIZE
+   -> then channels_last for kernel efficiency.
+  The two big wins are precision and filling the GPU.
+
+WHAT TO *NOT* BOTHER WITH on a conv-heavy / compute-bound workload like this
+(all neutral or negative for us):
+  cudnn.benchmark, torch.compile, TF32, gradient checkpointing,
+  gradient accumulation.
+These are WORKLOAD-DEPENDENT - torch.compile/TF32 shine on transformer/
+matmul-heavy models, not this one. Do not apply by reflex; measure.
+
+RECOMMENDED FINAL STACK (Exp 19, 17.84 img/s, +125% vs 7.93 baseline):
+  BF16 autocast | batch_size_per_gpu=11 | channels_last | fused SGD |
+  fused loss (cross_entropy) | GPU normalization (uint8 IPC) | workers=8 |
+  pin_memory | persistent_workers | CUDA prefetcher
+
+
+--------------------------------------------------------------------------------
+3. METRICS TO CAPTURE AND WATCH
+--------------------------------------------------------------------------------
+NORTH-STAR (the objective):
+  - Throughput (images/sec) - the truth. Everything else is diagnostic.
+  - Time-to-target-accuracy / wall-clock per epoch - THE business metric.
+    A 2x throughput that needs 3x epochs to converge is a regression.
+    Always watch the loss / val-accuracy curve alongside speed.
+
+DIAGNOSTIC (to locate the bottleneck):
+  - data_time per iter - fraction of step spent waiting on the loader.
+    High -> data-bound.
+  - GPU memory peak (% of capacity) - your batch-size budget / OOM margin.
+  - GPU utilization % - coarse compute-busy signal, BUT treat it skeptically:
+    it means "a kernel is running," not "running efficiently." We saw AMP DROP
+    util to 37% while being FASTER (faster steps shrink the busy fraction).
+    NEVER optimize for util%; optimize for throughput.
+  - Per-stage step breakdown (data / forward / backward / optimizer) via NVTX
+    ranges in Nsight Systems - where time actually goes.
+  - SM occupancy + tensor-core utilization (nsys / DCGM) - the REAL compute-
+    efficiency metric, vs. the misleading util%.
+
+THE WORKFLOW THAT TIES IT TOGETHER:
+  1. Profile a baseline (nsys + 1 Hz telemetry).
+  2. Triage the bottleneck with the table above.
+  3. Apply the MATCHING lever - do not apply memory fixes to a compute problem.
+  4. Change ONE THING AT A TIME and re-measure (OFAT - it is why we could
+     attribute every delta).
+  5. Re-profile: optimizing one bottleneck SHIFTS it. We walked
+     memory-bound -> (AMP) -> underutilized -> (batch) -> compute-bound, at
+     which point further memory/data work stopped paying off.
+
+
+--------------------------------------------------------------------------------
+4. BOTTOM LINE
+--------------------------------------------------------------------------------
+Focus on TRAINING TIME. Drive it with BF16 + max batch + channels_last (that is
+~90% of the +125%), keep fused SGD/loss as free cleanups, and STOP spending on
+memory/data once you are compute-bound - which profiling shows happens fast on a
+conv-heavy model on a single L4.
+
+Watch THROUGHPUT + TIME-TO-ACCURACY as goals, and DATA_TIME, MEMORY %, and NVTX
+STAGE TIMINGS as the instruments that tell you which lever to pull next.
+
+CAVEAT specific to where we ended: we are compute-bound on an L4, so remaining
+headroom is thin HERE. The moment you change the hardware (A100/H100), the model
+(add attention), or go MULTI-GPU, the bottleneck moves - TF32, torch.compile, and
+the DALI GPU data pipeline could suddenly become real wins. Re-profile when any
+of those change.
+================================================================================

@@ -1,0 +1,94 @@
+name: "hrnet_seg"
+backend: "python"
+
+# ---------------------------------------------------------------------------
+# Batching
+# ---------------------------------------------------------------------------
+# max_batch_size: 0  ==  NO server-side batching, on purpose.
+#
+# This model takes variable-length raw JPEG bytes and returns a segmentation map
+# sized to the ORIGINAL image (H×W differs per request), and the TRT engine was
+# compiled with batch dim = 1 (dynamic only over H,W: 256²->1024²). Those three
+# facts mean Triton's dynamic batcher cannot stack requests into one batch tensor,
+# so enabling `dynamic_batching {}` would add queueing latency for zero GPU speedup.
+#
+# The correct throughput+latency lever for a variable-resolution multi-scale model
+# is CONCURRENT INSTANCES (see instance_group below), not batching. If you want true
+# request batching, serve the fixed-resolution single-scale variant instead
+# (rebuild the engine with a batch dimension) — see triton_deploy/README.md.
+max_batch_size: 0
+
+input [
+  {
+    name: "IMAGE_BYTES"
+    data_type: TYPE_UINT8
+    dims: [ -1 ]          # raw JPEG/PNG bytes (variable length), GPU-decoded by DALI
+  },
+  {
+    name: "ORIG_SIZE"
+    data_type: TYPE_INT32
+    dims: [ 2 ]           # original (H, W)
+  }
+]
+
+output [
+  {
+    name: "SEGMENTATION"
+    data_type: TYPE_INT32
+    dims: [ -1, -1 ]      # per-pixel class id, shape (H, W)
+  }
+]
+
+# ---------------------------------------------------------------------------
+# Concurrency — the real throughput lever here
+# ---------------------------------------------------------------------------
+# N independent GPU instances run N requests truly in parallel. This is what gives
+# BOTH low latency (a new request never waits behind another on a busy instance)
+# and high throughput (CPU-side DALI decode of one request overlaps the GPU forward
+# of another). Each instance holds its own DALI pipeline + a reference to the shared
+# ~1.5 GB engine footprint.
+#
+# MEASURED on this T4: the GPU sits at 100% util under load — it is COMPUTE-BOUND on
+# the 116 ms forward. Extra instances therefore do NOT raise throughput (they time-slice
+# the same SMs and add contention); 3 instances hit ~7.3 img/s vs ~7.5 at 1. count:2 is
+# the chosen balance — enough to serve 2 concurrent client streams and hide the small
+# CPU/D2H/metric gaps, without the memory bloat (3 inst used 13 GB) or contention of more.
+# The real levers past this ceiling are a faster GPU, INT8 (−0.034 mIoU), or fewer scales.
+instance_group [
+  {
+    kind: KIND_GPU
+    count: 2
+    gpus: [ 0 ]
+  }
+]
+
+# ---------------------------------------------------------------------------
+# Latency/throughput micro-opts
+# ---------------------------------------------------------------------------
+# Pinned staging buffers for the H2D of IMAGE_BYTES and the D2H of the seg map
+# (Triton defaults these on; pinned explicitly to make the intent clear).
+optimization {
+  input_pinned_memory  { enable: true }
+  output_pinned_memory { enable: true }
+}
+
+# Instances are hot on load: model.py runs a synthetic-JPEG warmup in initialize()
+# so the first REAL request never pays engine autotune / DALI first-run costs.
+# (A config-level ModelWarmup is not used because it would need a valid JPEG blob;
+# the in-code warmup is strictly better here.)
+
+parameters: {
+  key: "ENGINE_PATH"       value: { string_value: "/engines/logits_fp16_trt.ts" }
+}
+parameters: {
+  key: "IMG_SIZES"         value: { string_value: "300,375,450,525,600" }
+}
+parameters: {
+  key: "IMG_MAX_SIZE"      value: { string_value: "1000" }
+}
+parameters: {
+  key: "NUM_CLASS"         value: { string_value: "150" }
+}
+parameters: {
+  key: "PADDING_CONSTANT"  value: { string_value: "32" }
+}

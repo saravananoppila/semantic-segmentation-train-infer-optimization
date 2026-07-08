@@ -1,0 +1,19 @@
+# Core dependencies for training + evaluation (HRNetV2 + C1 on ADE20K).
+# Pinned to the versions used for all training experiments in the reports.
+# Environment: Python 3.8, CUDA 12.1, cuDNN 9.1, NVIDIA driver 595.x.
+#
+# Install torch/torchvision from the cu121 index, e.g.:
+#   pip install torch==2.4.1 torchvision==0.19.1 --index-url https://download.pytorch.org/whl/cu121
+#   pip install -r requirements.txt
+#
+# See requirements-inference.txt for the (optional) TensorRT / DALI / ONNX / Triton stack.
+
+torch==2.4.1
+torchvision==0.19.1
+numpy==1.24.4
+scipy==1.10.1
+opencv-python==4.13.0.92
+yacs==0.1.8
+tqdm==4.68.2
+Pillow==10.4.0
+matplotlib==3.7.5

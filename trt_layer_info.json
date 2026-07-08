@@ -1,0 +1,27 @@
+{
+  "shape": [
+    1,
+    3,
+    512,
+    512
+  ],
+  "parsed_graph_layers": 781,
+  "engine_layers": 355,
+  "engine_size_mib": 129.87326431274414,
+  "layer_types": {
+    "?": 355
+  },
+  "layer_precisions": {
+    "?": 355
+  },
+  "fused_examples": [
+    "Reformatting CopyNode for Input Tensor 0 to /encoder/conv1/Conv + /encoder/relu/Relu",
+    "/encoder/conv1/Conv + /encoder/relu/Relu",
+    "/encoder/conv2/Conv + /encoder/relu_1/Relu",
+    "/encoder/layer1/layer1.0/conv1/Conv + /encoder/layer1/layer1.0/relu/Relu",
+    "/encoder/layer1/layer1.0/conv2/Conv + /encoder/layer1/layer1.0/relu_1/Relu",
+    "/encoder/layer1/layer1.0/conv3/Conv + /encoder/layer1/layer1.0/Add + /encoder/layer1/layer1.0/relu_2/Relu",
+    "/encoder/layer1/layer1.1/conv1/Conv + /encoder/layer1/layer1.1/relu/Relu",
+    "/encoder/layer1/layer1.1/conv2/Conv + /encoder/layer1/layer1.1/relu_1/Relu"
+  ]
+}

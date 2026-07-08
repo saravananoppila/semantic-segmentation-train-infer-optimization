@@ -1,0 +1,35 @@
+*.pyc
+__pycache__/
+
+ckpt/
+vis/
+log/
+pretrained/
+
+.ipynb_checkpoints
+
+ADE_val*.jpg
+ADE_val*.png
+
+.idea/
+
+# ---- Datasets (downloaded separately, never commit) ----
+data/
+!data/*.odgt
+
+# ---- Large / GPU-specific binary artifacts (too big for GitHub) ----
+trt_engines/
+nsys_reports/
+*.nsys-rep
+*.qdrep
+*.engine
+*.plan
+
+# ---- Raw experiment outputs (summarized in *_REPORT.md) ----
+*.log
+*.out
+*.csv
+ordered_stack_logs/
+
+# ---- Backups / scratch ----
+*.bak

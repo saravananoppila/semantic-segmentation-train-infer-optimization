@@ -1,0 +1,208 @@
+================================================================================
+TRAINING PERFORMANCE — Q&A (compute-bound vs memory-bound, ordering, methodology)
+Semantic Segmentation (HRNetV2 + C1), NVIDIA L4, single GPU
+Companion to: training_performance_recommendations.txt, experiments_ofat.md
+================================================================================
+
+
+--------------------------------------------------------------------------------
+Q1. What metric tells you it's compute-bound? Is it throughput?
+--------------------------------------------------------------------------------
+Throughput is the OBJECTIVE, not the CLASSIFIER. You use throughput to detect
+that a bottleneck exists and to validate a fix - but to CLASSIFY the bottleneck
+you need the step-time breakdown and GPU-gap analysis:
+
+  - data_time / step_time - if small (data hidden under compute) -> not data-bound.
+  - GPU idle gaps in the nsys timeline - the single clearest signal.
+      Kernels packed back-to-back, no gaps  -> COMPUTE-bound.
+      Gaps where GPU waits on H2D / data    -> DATA-bound.
+  - SM occupancy / tensor-core activity (nsys or DCGM) - high, sustained -> compute
+    is genuinely the work (not just "a kernel is running").
+  - THE PERTURBATION TEST (most decisive - what we actually did):
+      Speed up the suspected bottleneck and see if throughput moves.
+      We made data faster (DALI)        -> no change  -> not data-bound.
+      We freed memory (checkpointing)   -> throughput DROPPED -> not memory-bound.
+      What's left is COMPUTE.
+
+SUMMARY: watch throughput; CLASSIFY with the breakdown + the perturbation test.
+GPU util % is only a weak corroborating hint (it can mislead - AMP dropped util
+to 37% while being FASTER).
+
+
+--------------------------------------------------------------------------------
+Q2. Create a training script that runs the recommended order (to test).
+--------------------------------------------------------------------------------
+Delivered: run_ordered_stack.sh
+
+It runs the stack cumulatively in the recommended order and prints img/s per step:
+  1_baseline_fp32 (batch=2)  ->  2_bf16 (batch=2)  ->  3_max_batch (batch=11)
+  ->  4_fused_loss (batch=11)
+
+Toggleable in the script (cfg flags): precision (amp/BF16), batch size, workers,
+fused_loss. Always-on in train_single_gpu.py (from the OFAT study): channels_last,
+CUDA prefetcher, pin_memory, persistent_workers, fused SGD, GPU normalization.
+The fully-isolated per-layer breakdown of the always-on layers is in
+experiments_ofat.md (Exps 0-19). Quick schedule (NE=3 epochs, EI=120 iters);
+raise NE/EI at the top of the script for steadier numbers.
+
+MEASURED RESULT (this run):
+  Step              Config              Throughput   Delta
+  ----------------- ------------------- ------------ -------
+  1 baseline        fp32, batch=2       10.67 img/s    -
+  2 +BF16           batch=2             14.55 img/s   +36%
+  3 +max batch      batch=11            17.32 img/s   +19%
+  4 +fused loss     batch=11            17.32 img/s    +0%
+  Total: 10.67 -> 17.32 img/s = +62% (toggleable levers, on top of always-on layers)
+
+KEY OBSERVATION (ordering/dependency in action): BF16's +36% here is LARGER than
+BF16 alone in the isolated study, because channels_last is always-on - so turning
+on BF16 immediately unlocks the NHWC tensor-core conv kernels. BF16 + channels_last
+TOGETHER are worth far more than either alone. That is exactly why order/dependency
+matters: channels_last in fp32 does little; BF16 makes it pay off.
+
+(Note: baseline here is 10.67, not the OFAT 7.93, because this script bakes in
+channels_last/prefetcher/fused-SGD/GPU-norm. Absolute numbers slightly below the
+accepted-stack 17.84 due to the quick schedule = less cuDNN warmup.)
+
+
+--------------------------------------------------------------------------------
+Q3. Example where gradient checkpointing WINS (memory-bound).
+--------------------------------------------------------------------------------
+Training a large transformer / LLM, or high-res vision, where activations do not
+fit. Example: a ViT-Large or an LLM where, WITHOUT checkpointing, you can only fit
+batch=1 and the GPU sits ~30% util (starved). Turn on checkpointing -> activations
+shrink -> you now fit batch=8 -> GPU saturates. Each step is ~30% slower per image
+(recompute), but going batch=1 -> batch=8 MORE THAN TRIPLES throughput. Net win,
+because you were memory-bound / underutilized.
+
+In OUR setup it would flip to a win if you switched to 1024x1024 images or a bigger
+backbone (HRNet-W48 + heavy decoder) such that batch=2 OOMs. Then checkpointing is
+what lets you train at a usable batch AT ALL.
+
+Signature: batch capped by memory -> GPU underutilized -> checkpointing -> bigger
+batch -> GPU filled -> throughput up DESPITE recompute.
+
+
+--------------------------------------------------------------------------------
+Q4. When to use gradient accumulation?
+--------------------------------------------------------------------------------
+When you need a large EFFECTIVE batch for convergence but it will not fit in memory
+- and you do NOT expect it to speed things up (it does not). Accumulate gradients
+over N micro-batches, step once -> optimizer sees the gradient of an Nx-larger batch.
+
+Use it for:
+  - Reproducing a recipe that specifies batch=256 when only 32 fits -> accumulate 8x.
+  - Large-batch optimizers (LARS / LAMB) that need big effective batches.
+  - Stabilizing noisy small-batch training.
+
+NOT for throughput (same compute, just delayed optimizer steps).
+Caveat: BatchNorm stats are still computed per micro-batch, so it is NOT identical
+to a true large batch for BN models (LayerNorm transformers are unaffected).
+
+
+--------------------------------------------------------------------------------
+Q5. General approach to training-performance improvement.
+--------------------------------------------------------------------------------
+A tight loop - never guess, always measure:
+
+  1. Profile first. Baseline with nsys + telemetry + NVTX. Do not optimize blind.
+  2. Classify the bottleneck - data / compute / memory (Q1's breakdown + perturbation test).
+  3. Apply the MATCHING lever only. A memory fix for a compute problem is wasted
+     effort (the checkpointing lesson).
+  4. Change one thing, re-measure (OFAT). The only way to attribute a delta.
+  5. Expect the bottleneck to MOVE and chase it. We walked
+     memory-bound -> underutilized -> compute-bound; each fix exposed the next.
+  6. Order by dependency: precision -> batch -> layout -> data -> free cleanups.
+  7. Validate convergence, not just img/s. Track time-to-target-accuracy - a faster
+     step that needs more steps is a loss.
+  8. Re-profile when anything changes - hardware, model architecture, or going
+     multi-GPU. The "don't bother" list (TF32, torch.compile, DALI) can flip to wins
+     in a different regime.
+
+ONE-LINE PHILOSOPHY:
+  measure -> find the binding constraint -> spend effort only there -> re-measure
+  -> repeat. Most wasted optimization effort goes into improving something that is
+  not the bottleneck.
+================================================================================
+
+
+================================================================================
+ADDENDUM — metric definitions and interview points
+================================================================================
+
+--------------------------------------------------------------------------------
+Q6. What does "17.84 img/s" mean - per epoch or what?
+--------------------------------------------------------------------------------
+It is a RATE: images processed per WALL-CLOCK SECOND at steady state. NOT per epoch.
+
+How it is computed:
+  - Measure time for one training step (iteration) at steady state
+    (iters 20-180 of the profiled epoch, averaged).
+  - throughput = batch_size_per_gpu / mean_iter_time
+  - Exp 19: batch=11, mean iter ~0.617s -> 11 / 0.617 = 17.84 img/s
+
+Concrete epoch-level meaning (ADE20K = 20,210 training images):
+  - Baseline 7.93 img/s -> 20210 / 7.93  ~= 42 min / epoch
+  - Best    17.84 img/s -> 20210 / 17.84 ~= 19 min / epoch
+  => ~2.25x faster; roughly halves wall-clock training time.
+
+Note: experiments used a 200-iter SMOKE scale for fast profiling; the img/s RATE
+is what extrapolates to real epochs, not the 200-iter count.
+
+
+--------------------------------------------------------------------------------
+Q7. What is "data_time 0.15s"?
+--------------------------------------------------------------------------------
+It is the time PER ITERATION spent waiting for the next batch (the data-loading
+portion of the step, before compute). The training log prints two numbers per iter:
+
+  Epoch: [4][20/200], Time: 0.62, Data: 0.15, ...
+                            ^total/iter   ^data portion
+
+  - Time (0.62s) = total step = data + compute (forward + backward + optimizer)
+  - Data (0.15s) = time in next(iterator) getting the batch ready (the part NOT
+                   hidden by the prefetcher)
+
+So ~0.15s of each 0.62s step is data, ~0.47s is GPU compute. Data is small relative
+to compute -> NOT data-bound. It stayed pinned at 0.15s across decode/normalize
+changes -> a STRUCTURAL floor (CPU workers handing off a batch on 4 vCPUs), not
+something faster decode could fix. If data_time were ~half the step, you would be
+data-bound and would attack the loader.
+
+
+--------------------------------------------------------------------------------
+Q8. Impact points for interview / resume
+--------------------------------------------------------------------------------
+QUANTIFIED RESUME BULLETS:
+  - Optimized a PyTorch semantic-segmentation training pipeline (HRNetV2/ADE20K) on
+    NVIDIA L4, achieving 2.25x throughput (7.9 -> 17.8 img/s, +125%) - halving epoch
+    time from ~42 to ~19 min.
+  - Used Nsight Systems + NVTX + GPU telemetry to profile and drive the workload from
+    memory-bound/underutilized to compute-bound (~90% GPU util).
+  - Largest wins: mixed precision (BF16, -50% memory), max batch sizing (+43%), and
+    channels_last/NHWC tensor-core kernels (+23%).
+  - Ran 21 controlled one-factor-at-a-time experiments with a reproducible harness
+    (telemetry + nsys capture + automated throughput parsing) and a full report.
+  - Demonstrated that popular optimizations (torch.compile -17%, gradient checkpointing
+    -19.5%, cudnn.benchmark -7%, TF32) REGRESS on conv-heavy compute-bound workloads -
+    optimization is workload-dependent.
+  - Evaluated GPU data-loading (NVIDIA DALI, CV-CUDA); benchmarked DALI at ~8,000 img/s
+    but correctly concluded the data pipeline was not the bottleneck (Amdahl) - avoided
+    a non-impactful change.
+
+"JUDGMENT" TALKING POINTS (what senior interviewers probe for):
+  - The bottleneck-migration story: memory-cheap/underutilized -> (BF16) -> (batch
+    fills GPU) -> (channels_last) -> compute-bound. You optimize the CURRENT constraint
+    and chase it as it moves.
+  - Knowing what NOT to do: half the value was rejecting changes that regressed, and
+    being able to defend WHY each failed.
+  - Memory vs speed framing: "memory is a budget, not a goal" - proven by checkpointing
+    freeing 47% memory while LOSING 19.5% throughput.
+  - Metric skepticism: GPU util% is misleading (AMP dropped it to 37% while faster) -
+    optimize throughput, not vanity metrics.
+  - Rigor: one-factor-at-a-time isolation caught a hidden regression (cudnn.benchmark)
+    that a bundled change had masked.
+
+Lead with the bottleneck story and the what-not-to-do judgment - those separate
+"I turned on AMP" from "I understand GPU performance engineering."
+================================================================================

@@ -1,0 +1,25 @@
+{
+  "exp_name": "exp7_preprocess",
+  "timestamp": "2026-07-04T00:57:05",
+  "config": {
+    "num_images": 256,
+    "batch": 32,
+    "size": 512
+  },
+  "results": {
+    "cpu": {
+      "ms_per_img": 8.443525264321275,
+      "img_s": 118.43394419929932
+    },
+    "dali": {
+      "ms_per_img": 0.2199682513032523,
+      "img_s": 4546.110604940808
+    },
+    "cvcuda": {
+      "ms_per_img": 0.41376283593782165,
+      "img_s": 2416.84345026646
+    }
+  },
+  "parity_cvcuda_vs_cpu": 0.01957591250538826,
+  "parity_dali_vs_cpu": 0.013656786642968655
+}

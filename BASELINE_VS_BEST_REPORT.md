@@ -1,0 +1,128 @@
+# Baseline vs Best-Config — Full Metrics Comparison
+
+**Date:** 2026-06-29
+**Hardware:** NVIDIA L4 (23,034 MiB), 4 vCPUs · torch 2.4.1+cu121 · HRNetV2 + C1, 150 classes, ADE20K
+**Schedule (identical for both):** 10 epochs × 1000 iters = **10,000 optimizer steps**, seed 304,
+then eval on 2000 val images.
+
+> **Read the two comparison axes separately:**
+> - **Training/GPU metrics are a clean A/B** — same 10k-step schedule, same hardware, only the
+>   config differs.
+> - **Model-quality metrics (mIoU/acc) are NOT data-matched.** Because batch=11 vs batch=2 over the
+>   *same step count*, the best config sees **110k image-presentations vs the baseline's 20k (5.5×
+>   more)**. The mIoU gap therefore reflects the optimizations *and* the larger data exposure the
+>   bigger batch buys. See §5 for the honest interpretation.
+
+---
+
+## 1. Headline
+
+| | Baseline (fp32) | Best config | Δ |
+|---|---|---|---|
+| **Throughput** | 8.69 img/s | **16.86 img/s** | **1.94× faster** |
+| **Val Mean IoU** | 0.1431 | **0.3486** | +144% (confounded — see §5) |
+| **Val pixel acc** | 69.33% | **78.67%** | +9.3 pp |
+| GPU memory | 32.4% | 91.4% | +59 pp (spent, not wasted) |
+| Train wall clock | ~38 min | ~109 min | best does 5.5× the image-work |
+
+---
+
+## 2. Config diff
+
+| Knob | Baseline | Best config |
+|---|---|---|
+| Precision | fp32 | BF16 autocast |
+| Batch/GPU | 2 | 11 |
+| Data pipeline | plain `iter(loader)`, CPU normalize | CUDA prefetcher + GPU normalize (uint8 IPC) |
+| Memory format | contiguous (NCHW) | channels_last (NHWC) |
+| Optimizer | plain SGD | fused SGD |
+| Loss | NLLLoss | fused `F.cross_entropy` |
+| pin_memory / persistent_workers | off / off | on / on |
+| workers | 4 | 8 |
+| LR | 0.02 | 0.047 (sqrt-scaled for batch=11) |
+
+---
+
+## 3. Training-performance metrics  *(clean A/B — same 10k steps)*
+
+| Metric | Baseline | Best config |
+|---|---|---|
+| Throughput | **8.69 img/s** | **16.86 img/s** |
+| Mean steady iter time (20–980) | 0.230 s | 0.652 s |
+| Per-epoch throughput range | 8.48–8.95 | 16.07–17.33 |
+| data_time | 0.000 s | 0.162 s |
+| Images processed (10k steps) | 20,000 | 110,000 |
+
+The best config's iter is ~2.8× *longer* in wall-time, but each step does 5.5× the work, netting
+**1.94× more images/sec**. Both pipelines are data-starvation-free (data_time ≪ compute).
+
+## 4. GPU / hardware metrics  *(clean A/B)*
+
+| Metric | Baseline | Best config |
+|---|---|---|
+| GPU util (avg / max) | 90.6% / 100% | 98.5% / 100% |
+| Memory (avg) | 7,467 MiB (32.4%) | 21,062 MiB (91.4%) |
+| Memory (max) | 7,482 MiB (32.5%) | 21,110 MiB (91.6%) |
+| Power (avg / max) | 71.1 / 80 W | 71.7 / 78 W |
+| Temp (avg / max) | 78.7 / 85 °C | 80.3 / 85 °C |
+
+The headline efficiency story: the baseline **leaves 68% of VRAM idle**; the best config converts
+that idle memory into a 5.5× bigger batch and pushes util from 90.6% → 98.5%. Both sit at the L4's
+~72 W power wall — the GPU was never the idle bottleneck; the baseline simply under-used its memory.
+
+## 5. Model-performance metrics  *(NOT data-matched — interpret carefully)*
+
+| Metric | Baseline | Best config |
+|---|---|---|
+| Mean IoU | 0.1431 | 0.3486 |
+| Pixel accuracy (val) | 69.33% | 78.67% |
+| Per-class IoU median | 0.038 | 0.341 |
+| Zero-IoU classes | ~49 / 150 | 3 / 150 |
+| Final train pixel-acc | 71.85% | 84.74% |
+| Final train loss | 1.110 | 0.515 |
+| Inference time | 0.270 s/img | 0.268 s/img |
+
+**Honest reading:** at an *equal step budget* (10k iters), the best config produces a much stronger
+model (2.4× the mIoU). But that is **not** "same data, better model" — the batch=11 config saw 5.5×
+more images, and that extra exposure is a large part of the gap. A **data-matched** baseline (55k
+iters @ batch 2 = same 110k images) would close much of the mIoU difference. Inference latency is
+identical (same architecture; precision affects training, not this fp32 eval path).
+
+So the model-quality numbers answer *"in the same number of training steps, which config gives a
+better model?"* (best config, decisively) — not *"per image seen, which is better?"* (roughly equal).
+
+## 6. Convergence trajectory (end-of-epoch train pixel-acc)
+
+| Epoch | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| Baseline | 46.5 | 56.2 | 59.8 | 62.6 | 64.1 | 65.4 | 67.1 | 68.6 | 69.7 | 71.9 |
+| Best | 66.3 | 72.5 | 75.2 | 76.4 | 78.1 | 79.7 | 80.9 | 82.2 | 83.5 | 84.7 |
+
+Both converge cleanly with no divergence. The best config is ahead from epoch 1 (bigger batch =
+more images/epoch + sqrt-scaled LR) and stays ahead throughout. Baseline (batch=2) shows noisier
+per-epoch values — smaller batches give higher-variance gradient estimates.
+
+---
+
+## 7. Bottom line
+
+- **Speed: the optimized stack is a clean 1.94× throughput win** at the same step budget, on the
+  same hardware, with no instability — and the convergence run confirms it doesn't break training.
+- **Memory: the baseline wastes 68% of the GPU.** The single most important optimization is spending
+  that memory on a larger batch (the OFAT study's biggest lever, +43%).
+- **Model quality: better at equal steps, ~comparable per-image.** The optimizations don't degrade
+  the model; the mIoU lead at equal steps comes largely from the extra data the big batch processes.
+- For a publishable accuracy comparison, re-run both **data-matched** (equal image-presentations);
+  for a throughput/efficiency comparison, this report is already apples-to-apples.
+
+## Artifacts
+
+| | Baseline | Best config |
+|---|---|---|
+| Train log | `train_hrnetv2_baseline_convergence.log` | `train_hrnetv2_convergence.log` |
+| GPU telemetry | `gpu_metrics_baseline_convergence.csv` | `gpu_metrics_convergence.csv` |
+| Eval log | `eval_hrnetv2_baseline_convergence.log` | `eval_hrnetv2_convergence.log` |
+| Checkpoints | `ckpt/ade20k-hrnetv2-c1-baseline/` | `ckpt/ade20k-hrnetv2-c1-convergence/` |
+| Runner | `run_baseline.sh` | `run_convergence.sh` |
+
+Full single-config detail for the best config: see `CONVERGENCE_REPORT.md`.

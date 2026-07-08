@@ -1,0 +1,22 @@
+# Optional inference / deployment stack — needed only to reproduce the INFERENCE
+# experiments (TensorRT, DALI/CV-CUDA preprocessing, ONNX Runtime, OpenVINO, Triton).
+# NOT required for training. Pinned to the versions used in the inference reports.
+#
+# These wheels are CUDA-version-specific (built for CUDA 12.x) and some pull large
+# NVIDIA runtime deps. Install into the same env as requirements.txt AFTER torch:
+#   pip install -r requirements-inference.txt
+#
+# Notes:
+#   - tensorrt / torch-tensorrt provide the TensorRT engine build (infer_trt.py, infer_trt_dali.py).
+#   - nvidia-dali-cuda120 and cvcuda-cu12 are the GPU-decode/preprocess backends (bench_preprocess.py).
+#   - onnx/onnxruntime/openvino back the CPU-runtime study (infer_cpu_runtimes.py).
+#   - tritonclient is only needed to drive the Triton server (triton_deploy/, infer_triton_client.py).
+
+tensorrt==10.1.0
+torch-tensorrt==2.4.0
+nvidia-dali-cuda120==1.49.0
+cvcuda-cu12==0.15.0
+onnx==1.17.0
+onnxruntime==1.19.2
+openvino==2024.4.0
+tritonclient==2.66.0
